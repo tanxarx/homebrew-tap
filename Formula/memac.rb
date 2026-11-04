@@ -9,11 +9,16 @@
 # Principle V (local-first, no egress): the model/dylib ride INSIDE the tarball, sha256-verified by
 # Homebrew on download and again by the daemon at load. Nothing is fetched from a model hub, ever.
 #
-# INSTALL COMMAND: `HOMEBREW_NO_SANDBOX=1 brew install sibyllinex/tap/memac`.
-# The `NO_SANDBOX` is required so `post_install` may write OUTSIDE the Homebrew prefix — it stages
-# the runtime assets into `~/Library/Application Support/mem-mac` and wires the Claude Code hook +
-# MCP into `~/.claude/settings.json` and the shell-capture block into `~/.zshrc`. Homebrew sandboxes
-# post_install by default, which silently blocks those home-dir writes.
+# INSTALL COMMAND: `brew install sibyllinex/tap/memac`, then the two user-run setup commands that
+# `post_install` prints (also in `caveats`): restage the runtime assets into
+# `~/Library/Application Support/mem-mac` and wire the Claude Code hook + MCP into
+# `~/.claude/settings.json` and the shell-capture block into `~/.zshrc`.
+#
+# post_install cannot do those home writes itself (tanxarx/memac#55). Homebrew sandboxes it with
+# `sandbox-exec`, which denies the real home, and Homebrew 7 also points its HOME at a throwaway
+# temp dir. A home write there silently lands in that decoy home, which Homebrew deletes, while
+# the log reads as success. `HOMEBREW_NO_SANDBOX` is not an escape hatch: it was removed from
+# Homebrew at 2.2.12 and is ignored. So post_install makes no home writes; it only warns.
 #
 # Naming: the package/command is `memac`; the binaries are still `memmac*` — `bin.install_symlink`
 # aliases `memac` -> `memmac`. The Claude Code hook + MCP keys stay `memmac`.
@@ -27,36 +32,36 @@ class Memac < Formula
 
   depends_on arch: :arm64
   depends_on :macos
-  depends_on "node" # post_install wires ~/.claude/settings.json via the tested TS installer
-
-  def data_root
-    Pathname.new(Dir.home)/"Library/Application Support/mem-mac"
-  end
+  depends_on "node" # the user-run install-hooks step reuses the tested TS installer
 
   def install
     # Prebuilt binaries — just place them. `memac` is the command; the crates stay `memmac*`.
     bin.install "bin/memmacd", "bin/memmac", "bin/memmac-mcp", "bin/memmac-hook"
     bin.install_symlink "memmac" => "memac"
     # The compiled TS installer + the runtime assets (model, dylib, zsh capture hook), stashed for
-    # post_install. `memmac-hook.zsh` MUST ship here: the zshrc block `source`s it by this path.
+    # the user-run setup. `memmac-hook.zsh` MUST ship here: the zshrc block `source`s it by this path.
     libexec.install "dist"
     (libexec/"assets").install "assets/models", "assets/sqlite-vec", "assets/memmac-hook.zsh"
   end
 
-  def post_install
-    # Runs with the REAL user HOME (not a build home), so this stages to the actual data dir and
-    # wires the actual ~/.claude/settings.json + ~/.zshrc. Requires HOMEBREW_NO_SANDBOX=1 (writes
-    # outside the Homebrew prefix).
-    assets = data_root/"assets"
-    assets.mkpath
-    (data_root/"data").mkpath
-    (data_root/"logs").mkpath
-    cp_r libexec/"assets/models", assets, remove_destination: true
-    cp_r libexec/"assets/sqlite-vec", assets, remove_destination: true
+  # The two user-run steps that wire this keg into the real home: restage the runtime assets
+  # (sha256 is re-verified at load) and wire the hooks + MCP against the stable opt_bin. Both are
+  # idempotent and preserve the user's other hooks/servers (the tested TS merge).
+  def manual_setup_commands
+    <<~EOS.chomp
+      cp -R #{opt_libexec}/assets/models #{opt_libexec}/assets/sqlite-vec "$HOME/Library/Application Support/mem-mac/assets/"
+      node #{opt_libexec}/dist/cli.js install-hooks --bin-dir #{opt_bin}
+    EOS
+  end
 
-    # Idempotent: preserves your other hooks/servers, and wires the shell-capture block into
-    # ~/.zshrc pointing at libexec/assets/memmac-hook.zsh (the tested TS merge).
-    system "node", libexec/"dist/cli.js", "install-hooks", "--bin-dir", opt_bin
+  # No home writes here (tanxarx/memac#55): see the header. Say plainly that the user must run them.
+  def post_install
+    opoo <<~EOS
+      memac hooks were NOT wired and runtime assets were NOT staged.
+      Homebrew runs post_install in a sandbox with a temporary HOME, so it cannot reach yours.
+      Run these yourself (idempotent; re-run after every upgrade):
+      #{manual_setup_commands}
+    EOS
   end
 
   service do
@@ -72,9 +77,15 @@ class Memac < Formula
     <<~EOS
       memac (Apple Silicon, prebuilt bottle) is installed.
 
-      If you did NOT install with `HOMEBREW_NO_SANDBOX=1`, the hook wiring was likely blocked by
-      Homebrew's post_install sandbox. Wire it manually (idempotent):
-        node #{opt_libexec}/dist/cli.js install-hooks --bin-dir #{opt_bin}
+      REQUIRED — stage the assets and wire the hooks into your home directory:
+      #{manual_setup_commands.gsub(/^/, "  ")}
+
+      Homebrew runs post_install inside a sandbox with a temporary HOME, so these steps cannot
+      be automated. They are idempotent — re-run them after every upgrade.
+
+      KNOWN LIMITATION — the commands above refresh an existing
+      ~/Library/Application Support/mem-mac/; they do not create the data layout a
+      never-installed machine needs. On a fresh machine, use memac's npm installer.
 
       Start the memory daemon (a per-user LaunchAgent):
         brew services start memac
